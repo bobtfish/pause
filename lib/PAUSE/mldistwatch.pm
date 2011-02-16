@@ -29,6 +29,7 @@ use PAUSE ();
 use PAUSE::MailAddress ();
 use Safe;
 use Text::Format;
+use JSON 2.00 ();
 {
     my $HAVE_YAML = eval { require YAML; 1; };
     my $HAVE_YAML_SYCK = eval { require YAML::Syck; 1; };
@@ -38,6 +39,11 @@ use Text::Format;
             $HAVE_YAML_SYCK ? "YAML::Syck" :
                 $HAVE_YAML ? "YAML" :
                     die "Found neither YAML::XS nor YAML::Syck nor YAML installed";
+}
+{
+    my $HAVE_JSON_XS = eval { require JSON::XS; 1; };
+    $PAUSE::dist::JSON_MODULE =
+        $HAVE_JSON_XS ? "JSON::XS" : "JSON";
 }
 
 $Data::Dumper::Indent = 1;
@@ -1601,6 +1607,7 @@ Please contact modules\@perl.org if there are any open questions.
         my($distrobasename) = $substrdistro =~ m|.*/(.*)|;
         my $versions_from_metayaml = $self->{VERSION_FROM_YAML_OK} ? "yes" : "no";
         my $yaml_module_version = $PAUSE::dist::YAML_MODULE->VERSION;
+        my $json_module_version = $PAUSE::dist::JSON_MODULE->VERSION;
         push @m, qq{
                User: $author ($asciiname)
   Distribution file: $distrobasename
@@ -1608,7 +1615,9 @@ Please contact modules\@perl.org if there are any open questions.
          *.pm files: $pmfiles
              README: $self->{README}
            META.yml: $self->{YAML}
+          META.json: $self->{JSON}
         YAML-Parser: $PAUSE::dist::YAML_MODULE $yaml_module_version
+        JSON-Parser: $PAUSE::dist::JSON_MODULE $json_module_version
   META-driven index: $versions_from_metayaml
   Timestamp of file: $mtime UTC
    Time of this run: $time UTC\n\n};
@@ -2074,13 +2083,20 @@ Please contact modules\@perl.org if there are any open questions.
     # package PAUSE::dist;
     sub extract_readme_and_yaml {
         my $self = shift;
+        $self->extract_readme;
+        $self->extract_json_or_yaml;
+    }
+
+    # package PAUSE::dist;
+    sub extract_readme {
+        my $self = shift;
         my($suffix) = $self->{SUFFIX};
         return unless $suffix;
         my $dist = $self->{DIST};
         my $MLROOT = $self->mlroot;
         my @manifind = @{$self->{MANIFOUND}};
-        my(@readme) = grep /(^|\/)readme/i, @manifind;
         my($sans) = $dist =~ /(.*)\.\Q$suffix\E$/;
+        my(@readme) = grep /(^|\/)readme/i, @manifind;
         if (@readme) {
             my $readme;
             if ($sans =~ /-bin-?(.*)/) {
@@ -2106,6 +2122,58 @@ Please contact modules\@perl.org if there are any open questions.
             $self->{README} = "No README found";
             $self->verbose(1,"No readme in $dist\n");
         }
+    }
+
+    # package PAUSE::dist;
+    sub extract_json_or_yaml {
+        my $self = shift;
+        $self->extract_json;
+        $self->extract_yaml();
+    }
+
+    # package PAUSE::dist;
+    sub extract_json {
+        my $self = shift;
+        my($suffix) = $self->{SUFFIX};
+        my $dist = $self->{DIST};
+        my $MLROOT = $self->mlroot;
+        my @manifind = @{$self->{MANIFOUND}};
+        my($sans) = $dist =~ /(.*)\.\Q$suffix\E$/;
+        my $json = List::Util::reduce { length $a < length $b ? $a : $b }
+            grep !m|/t/|, grep m|/META\.json$|, @manifind;
+        if (defined $json) {
+            $self->{JSON} = $json;
+            File::Copy::copy $json, "$MLROOT/$sans.meta";
+            utime((stat $json)[8,9], "$MLROOT/$sans.meta");
+            PAUSE::newfile_hook("$MLROOT/$sans.meta");
+            if (-s $json) {
+                # We store in YAML_CONTENT as json overrides YAML - todo rename to META_CONTENT?
+                if ($self->{YAML_CONTENT} = eval { JSON::decode_json(do { open my($f), $json or die; local $/; <$f> }) }) {
+                    return 1;
+                } else {
+                    $self->{YAML_CONTENT} = {};
+                    $self->{JSON} = "META.json found but error ".
+                        "encountered while loading: $@";
+                }
+                # Even if the .json is bad, we don't try to fallback to YAML
+                $self->{YAML_CONTENT} ||= {};
+            } else {
+                $self->{JSON} = "Empty META.json found, ignoring";
+            }
+        } else {
+            $self->{JSON} = "No META.json found";
+            $self->verbose(1,"No META.json in $dist");
+        }
+    }
+
+    # package PAUSE::dist;
+    sub extract_yaml {
+        my $self = shift;
+        my($suffix) = $self->{SUFFIX};
+        my $dist = $self->{DIST};
+        my $MLROOT = $self->mlroot;
+        my @manifind = @{$self->{MANIFOUND}};
+        my($sans) = $dist =~ /(.*)\.\Q$suffix\E$/;
         my $yaml = List::Util::reduce { length $a < length $b ? $a : $b }
             grep !m|/t/|, grep m|/META\.yml$|, @manifind;
         if (defined $yaml) {
@@ -2115,7 +2183,8 @@ Please contact modules\@perl.org if there are any open questions.
                 utime((stat $yaml)[8,9], "$MLROOT/$sans.meta");
                 PAUSE::newfile_hook("$MLROOT/$sans.meta");
                 my $yamlloadfile = \&{"$YAML_MODULE\::LoadFile"};
-                eval { $self->{YAML_CONTENT} = $yamlloadfile->($yaml); };
+                my $data;
+                eval { $data = $yamlloadfile->($yaml); };
                 if ($@) {
                     $self->verbose(1,"Error while parsing YAML: $@");
                     if ($@ =~ /msg: Unrecognized implicit value/) {
@@ -2127,21 +2196,25 @@ Please contact modules\@perl.org if there are any open questions.
                         my $cat = do { open my($f), $yaml or die; local $/; <$f> };
                         $cat =~ s/:(\s+)(\S+)$/:$1"$2"/mg;
                         my $yamlload     = \&{"$YAML_MODULE\::Load"};
-                        eval { $self->{YAML_CONTENT} = $yamlload->($cat); };
-                        if ($@) {
-                            $self->{YAML_CONTENT} = {};
+                        if (eval { $data = $yamlload->($cat); }) {
+                            if ($self->{YAML_CONTENT}) {
+                                $self->{YAML} = "META.yml found but overridden by META.json";
+                            } else {
+                                $self->{YAML_CONTENT} = $data;
+                            }
+                        } else {
                             $self->{YAML} = "META.yml found but error ".
                                 "encountered while loading: $@";
                         }
 
                     } else {
-                        $self->{YAML_CONTENT} = {};
                         $self->{YAML} = "META.yml found but error ".
                             "encountered while loading: $@";
                     }
+                    $self->{YAML_CONTENT} ||= {}
                 }
             } else {
-                $self->{YAML} = "Empty META.yml found, ignoring\n";
+                $self->{YAML} = "Empty META.yml found, ignoring";
             }
         } else {
             $self->{YAML} = "No META.yml found";
